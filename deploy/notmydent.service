@@ -1,5 +1,5 @@
 [Unit]
-Description=Not my Dent FastAPI demo
+Description=Not my Dent FastAPI service
 After=network-online.target
 Wants=network-online.target
 
@@ -10,6 +10,10 @@ Group=notmydent
 WorkingDirectory=/opt/notmydent
 Environment=PYTHONUNBUFFERED=1
 Environment=MPLCONFIGDIR=/tmp/notmydent-mpl
+Environment=MPLBACKEND=Agg
+Environment=YOLO_CONFIG_DIR=/tmp/notmydent-yolo
+Environment=HF_HOME=/var/lib/notmydent/huggingface
+StateDirectory=notmydent
 ExecStart=/opt/notmydent/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 1 --proxy-headers --forwarded-allow-ips 127.0.0.1
 Restart=always
 RestartSec=5
