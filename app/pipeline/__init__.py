@@ -1,1 +1,1 @@
-"""Replace the mock processor with the proprietary pipeline here."""
+"""NotMyDent engine (engine.py) and the server-side runner (runner.py)."""
