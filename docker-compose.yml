@@ -1,0 +1,21 @@
+services:
+  notmydent:
+    build: .
+    image: notmydent
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8000:8000"   # Nginx on the host proxies to this; keep it private.
+    volumes:
+      - models:/models          # Hugging Face weights persist across restarts.
+    environment:
+      - HF_TOKEN=${HF_TOKEN:-}  # Optional; avoids Hub rate limits.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+volumes:
+  models:

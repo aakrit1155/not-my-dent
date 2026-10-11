@@ -1,6 +1,6 @@
 [project]
 name = "not-my-dent"
-version = "0.1.0"
+version = "0.2.0"
 description = "Team Everest's rental damage claim demo"
 requires-python = ">=3.12,<3.13"
 dependencies = [
@@ -13,6 +13,18 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Versions match the tested Colab notebook. Install torch from the CUDA index first (see Dockerfile).
+ml = [
+  "torch==2.8.0",
+  "torchvision==0.23.0",
+  "transformers==4.57.1",
+  "accelerate==1.11.0",
+  "bitsandbytes==0.48.1; sys_platform != 'darwin'",  # CUDA-only; no macOS wheels
+  "ultralytics==8.3.221",
+  "huggingface-hub==0.36.0",
+  "opencv-python==4.12.0.88",
+  "av==16.0.1",
+]
 test = ["httpx>=0.27,<1", "pytest>=8,<10"]
 
 [build-system]
