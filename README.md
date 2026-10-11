@@ -1,48 +1,66 @@
 # Not my Dent
 
-Team Everest's rental vehicle damage claim demo. The interface and API are runnable without CUDA, model weights, LangChain, YOLO, or paid vision APIs. **All verdicts, confidence numbers, and before/after frames are simulated. Uploaded videos are accepted but not inspected.** An uploaded vendor photo appears in the third panel of the generated proof image.
+Team Everest's rental vehicle damage claim checker. Upload a BEFORE walkaround video, an AFTER return video, the rental company's damage photo, and their written claim. The server runs the NotMyDent engine from `notmydent.ipynb` (YOLOv8 damage detection → CLIP + SIFT frame alignment → Qwen3-VL-8B comparison) and shows the verdict, timestamps, descriptions, detector scores and evidence images.
+
+A CUDA GPU is required (the 4-bit Qwen3-VL-8B needs roughly 8–10 GB of VRAM; an A40 / L40S is plenty).
 
 ## Layout
 
 ```text
 not-my-dent/
 ├── app/
-│   ├── main.py                 # FastAPI application, HTML, static files
-│   ├── routes/claims.py        # Upload, job polling, proof PNG endpoint
-│   ├── pipeline/mock.py        # Replaceable mock processor
-│   ├── templates/index.html    # Responsive single-page interface
+│   ├── main.py                 # FastAPI app; preloads models in the background at startup
+│   ├── routes/claims.py        # Upload, job polling, evidence-image endpoints
+│   ├── pipeline/engine.py      # The notebook engine (run_notmydent), logic unchanged
+│   ├── pipeline/runner.py      # Loads models once, runs one GPU job at a time
+│   ├── templates/index.html    # Single-page interface
 │   └── static/                 # CSS and vanilla JavaScript
-├── deploy/
-│   ├── nginx-notmydent.conf
-│   └── notmydent.service
-├── tests/test_flow.py
-└── pyproject.toml
+├── data/                       # Sample before/after videos and claim photo
+├── deploy/                     # Nginx site + systemd unit (bare-metal option)
+├── Dockerfile
+├── docker-compose.yml
+└── tests/test_flow.py          # HTTP flow tests with a fake engine (no GPU needed)
 ```
 
-The `uploads/` concept is implemented as a unique temporary directory under the OS temp directory per request, rather than a project directory. Input files are removed as soon as the job finishes. The PNG and report live in process memory for 20 minutes after completion, then expire on the next API request. The service has **one Uvicorn worker** because its job registry is in memory. A restart loses active jobs and reports. In production, use a durable job queue and object storage if jobs must survive restarts or run across workers.
+**How it runs.** On startup a background thread loads YOLO, CLIP and Qwen3-VL into GPU memory once; `/healthz` reports `models: loading | ready | failed`. Every request reuses those models. Jobs run one at a time behind a lock (up to 3 may be queued). Uploaded inputs are deleted when a job finishes; result images are kept for 1 hour and served from `/api/jobs/{id}/files/...`. Jobs live in memory, so run **one Uvicorn worker**; a restart drops in-flight jobs.
 
-## Local run
+The only changes to the notebook engine: `load_clip()` / `load_vlm()` cache models (like `load_detector()` already did) instead of loading and freeing them on every call, YOLO is no longer moved to the CPU after detection, so it stays ready for the next request, and matplotlib uses the non-GUI `Agg` backend so figures can be saved from worker threads.
+
+## API
 
 ```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
-export PATH="$HOME/.local/bin:$PATH"
-cd not-my-dent
-uv python install 3.12
+curl -sS -X POST http://127.0.0.1:8000/api/verify-claim \
+  -F video_before=@data/before.mp4 -F video_after=@data/after.mp4 -F claim_image=@data/scratch.png \
+  -F 'claim_text=Scratches on the front bumper'
+# → 202 {"job_id": ..., "status_url": "/api/jobs/JOB_ID"}
+curl -sS http://127.0.0.1:8000/api/jobs/JOB_ID
+# → {"state": "queued" | "processing"} … then {"state": "complete", "report": {...}}
+```
+
+`report` is exactly what `run_notmydent()` returns (`claim`, `overall_verdict`, `findings[]` with `company` / `before` / `after` descriptions, statuses, timestamps, detector confidences, and `comparisons`). Image paths in it are rewritten to URLs. Limits: 220 MiB per video, 15 MiB for the photo. With the sample data and that claim, the expected verdict is **POSSIBLE NEW DAMAGE**.
+
+## Run with Docker (recommended)
+
+Needs the NVIDIA driver plus the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) on the host.
+
+```bash
+docker compose up -d --build
+docker compose logs -f          # first start downloads ~17 GB of Qwen3-VL weights into the "models" volume
+curl -sS http://127.0.0.1:8000/healthz
+```
+
+Open <http://127.0.0.1:8000>. The site is usable immediately; jobs submitted while models load wait in the queue. Weights persist in the `models` volume, so later restarts only take the load time. Set `HF_TOKEN` in the environment to avoid Hugging Face rate limits.
+
+## Local development (UI only, no GPU)
+
+```bash
 uv venv --python 3.12
 uv pip install -e '.[test]'
 .venv/bin/uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
+.venv/bin/python -m pytest -q
 ```
 
-Open <http://127.0.0.1:8000>, click **Load demo inputs**, then **Run verification**. To check the API directly:
-
-```bash
-curl -sS -X POST http://127.0.0.1:8000/api/verify-claim -F demo=true -F 'claim_text=Deep dent on front passenger bumper'
-# Copy job_id from the response:
-curl -sS http://127.0.0.1:8000/api/jobs/JOB_ID
-curl -o proof.png http://127.0.0.1:8000/api/jobs/JOB_ID/proof
-```
-
-For uploaded files, omit `demo=true` and send `-F video_before=@before.mp4 -F video_after=@after.mp4 -F claim_image=@photo.jpg` with `claim_text`. Limits: 220 MiB for each video, 15 MiB for the photo, and 500 MiB total at Nginx. The FastAPI endpoint returns HTTP 202 and a `status_url`; poll until `state=complete`, then fetch `report.proof_image_url` for a PNG. The image endpoint sends `Cache-Control: no-store`. Demo mode needs no files and generates sample frames and a sample vendor panel on demand.
+Without the `ml` extra the page and API work, `/healthz` shows `models: failed`, and submitted jobs fail. Install `.[ml]` on a CUDA machine for real inference.
 
 ## Vultr Ubuntu 22.04 / 24.04 deployment
 
@@ -69,41 +87,28 @@ sudo reboot
 nvidia-smi
 ```
 
-The mock demo does not need a CUDA toolkit. When integrating models, select the CUDA/PyTorch wheels supported by the installed driver and check the framework independently, e.g. `python -c 'import torch; print(torch.cuda.is_available())'` after installing PyTorch. On a Vultr managed/vGPU image, follow the image's vendor driver/licensing guidance before replacing a working driver.
+You don't need a CUDA toolkit on the host: the Docker image ships PyTorch's CUDA 12.6 runtime, which needs driver 525 or newer. To check the GPU inside the container, run `sudo docker compose exec notmydent python -c 'import torch; print(torch.cuda.is_available())'`. On a Vultr managed/vGPU image, follow the image's vendor driver/licensing guidance before replacing a working driver.
 
 ### 2. Install and start the application
 
-Transfer the project archive to the VM (run on your local machine):
+Copy the project to the VM (e.g. `scp -r not-my-dent YOUR_SSH_USER@SERVER_IPV4:/opt/notmydent`), then install Docker and the NVIDIA Container Toolkit and start it:
 
 ```bash
-scp not-my-dent-team-everest.zip YOUR_SSH_USER@SERVER_IPV4:/tmp/
-```
-
-On the VM:
-
-```bash
-sudo apt update
-sudo apt install -y curl ca-certificates nginx snapd unzip
-sudo useradd --system --user-group --home-dir /opt/notmydent --shell /usr/sbin/nologin notmydent
-sudo mkdir -p /opt/notmydent
-cd /tmp
-unzip -q not-my-dent-team-everest.zip
-sudo cp -a /tmp/not-my-dent/. /opt/notmydent/
-sudo chown -R notmydent:notmydent /opt/notmydent
-curl -LsSf https://astral.sh/uv/install.sh | sh
-export PATH="$HOME/.local/bin:$PATH"
-sudo mkdir -p /opt/notmydent-python
-sudo chown notmydent:notmydent /opt/notmydent-python
-UV_PYTHON_INSTALL_DIR=/opt/notmydent-python uv python install 3.12
+curl -fsSL https://get.docker.com | sudo sh
+curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+curl -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
+  | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
+  | sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+sudo apt update && sudo apt install -y nvidia-container-toolkit nginx snapd
+sudo nvidia-ctk runtime configure --runtime=docker && sudo systemctl restart docker
 cd /opt/notmydent
-UV_PYTHON_INSTALL_DIR=/opt/notmydent-python uv venv --clear --python 3.12 .venv
-uv pip install --python .venv/bin/python -e .
-sudo chown -R notmydent:notmydent /opt/notmydent /opt/notmydent-python
-.venv/bin/python --version
-.venv/bin/python -c 'import fastapi, matplotlib, PIL; print("Dependencies OK")'
+sudo docker compose up -d --build
+curl -sS http://127.0.0.1:8000/healthz
 ```
 
-The managed Python lives under `/opt/notmydent-python` so the `notmydent` service account can access its interpreter. `--clear` replaces an existing Python 3.11 virtual environment when upgrading. If the server already has an appropriate system Python 3.12, you can instead use `uv venv --clear --python /usr/bin/python3.12 .venv`.
+The container restarts automatically (`restart: unless-stopped`) and listens only on `127.0.0.1:8000`. To update: copy the new code and rerun `sudo docker compose up -d --build`.
+
+**Without Docker:** create a Python 3.12 venv in `/opt/notmydent`, install `torch==2.8.0 torchvision==0.23.0 --index-url https://download.pytorch.org/whl/cu126`, then `pip install -e '.[ml]'`, and use `deploy/notmydent.service` (it sets `HF_HOME=/var/lib/notmydent/huggingface` so weights are cached in a writable directory).
 
 ### 3. Configure Porkbun DNS
 
@@ -122,14 +127,11 @@ dig +short A notmydent.biz
 dig +short CNAME www.notmydent.biz
 ```
 
-### 4. Install systemd and Nginx
+### 4. Install Nginx
+
+If you're not using Docker, first install the unit: `sudo cp /opt/notmydent/deploy/notmydent.service /etc/systemd/system/ && sudo systemctl daemon-reload && sudo systemctl enable --now notmydent`.
 
 ```bash
-sudo cp /opt/notmydent/deploy/notmydent.service /etc/systemd/system/notmydent.service
-sudo systemctl daemon-reload
-sudo systemctl enable --now notmydent
-sudo systemctl status notmydent --no-pager
-curl -sS http://127.0.0.1:8000/healthz
 sudo cp /opt/notmydent/deploy/nginx-notmydent.conf /etc/nginx/sites-available/notmydent
 sudo ln -s /etc/nginx/sites-available/notmydent /etc/nginx/sites-enabled/notmydent
 sudo rm -f /etc/nginx/sites-enabled/default
@@ -138,22 +140,7 @@ sudo systemctl enable --now nginx
 sudo systemctl reload nginx
 ```
 
-For an **existing Not my Dent installation**, stop the service before copying this release and rerun the Python 3.12 environment commands above, then restart it. Old in-memory jobs and proof images will be lost during the restart:
-
-```bash
-sudo systemctl stop notmydent
-sudo cp -a /tmp/not-my-dent/. /opt/notmydent/
-cd /opt/notmydent
-UV_PYTHON_INSTALL_DIR=/opt/notmydent-python uv python install 3.12
-UV_PYTHON_INSTALL_DIR=/opt/notmydent-python uv venv --clear --python 3.12 .venv
-uv pip install --python .venv/bin/python -e .
-sudo chown -R notmydent:notmydent /opt/notmydent /opt/notmydent-python
-.venv/bin/python --version
-sudo systemctl start notmydent
-curl -sS http://127.0.0.1:8000/healthz
-```
-
-The full service and server blocks are in `deploy/notmydent.service` and `deploy/nginx-notmydent.conf`. Nginx allows 500M requests, streams them upstream, gives uploads 300-second idle timeouts, and gives polling/report requests a 300-second upstream timeout. There is no long model request in the mock implementation. Make sure `/tmp` has enough free disk for FastAPI's spooled multipart data and the per-job copies; allow at least ~1 GiB free per concurrent maximum-size upload plus additional headroom. Nginx's configured 500M limit is decimal megabytes; two 220 MiB videos plus one 15 MiB image fit below it.
+Nginx allows 500M uploads, streams them to the app, and uses 300-second timeouts. Analysis itself runs in the background while the browser polls, so long jobs don't hit proxy timeouts. Keep at least ~1 GiB free in `/tmp` per concurrent maximum-size upload.
 
 If UFW is active:
 
@@ -178,21 +165,6 @@ sudo nginx -t
 curl -I https://notmydent.biz/
 ```
 
-If `/usr/bin/certbot` exists already, skip the `ln -s` line. Certbot's snap installs automatic renewal. Check service logs with `sudo journalctl -u notmydent -f`; view the final site using `https://notmydent.biz`.
-
-## Integrating the Colab pipeline later
-
-The project targets Python 3.12, matching the pipeline's Colab interpreter. Qwen3-V-4B, YOLO, PyTorch, and related model packages are intentionally **not** included in `pyproject.toml`. When adding them, reproduce the tested model package versions and choose a PyTorch CUDA build compatible with the Vultr NVIDIA driver; Colab's preinstalled CUDA stack and GPU drivers may differ from the server. Keep the mock path available for lightweight smoke tests. GPU memory needs and inference duration will also affect the queue design once the real processor is connected.
-
-## Replacing the mock pipeline
-
-Replace `process_claim_pipeline(...)` in `app/pipeline/mock.py`, or point the import in `app/routes/claims.py` at your implementation. Keep the signature `(video_before: Path | None, video_after: Path | None, claim_text: str, claim_image: Path | None) -> tuple[dict, bytes]`. The video and photo paths are valid only for the duration of the call. Generate the proof PNG into `io.BytesIO`, return `output.getvalue()`, and keep the report JSON serializable. If real inference takes minutes or needs multiple workers/restart recovery, move job execution to a queue and replace the in-memory registry with durable status storage. Replace the mock labels and confidence text only after real validation.
-
-## Test
-
-```bash
-uv pip install -e '.[test]'
-.venv/bin/python -m pytest -q
-```
+If `/usr/bin/certbot` exists already, skip the `ln -s` line. Certbot's snap installs automatic renewal. Check logs with `sudo docker compose logs -f` (or `sudo journalctl -u notmydent -f` without Docker); view the final site using `https://notmydent.biz`.
 
 References for server setup: [Astral uv installation](https://docs.astral.sh/uv/getting-started/installation/), [uv Python versions](https://docs.astral.sh/uv/guides/install-python/), [Ubuntu NVIDIA server driver guide](https://ubuntu.com/server/docs/nvidia-drivers-installation/), [Porkbun DNS records](https://kb.porkbun.com/article/231-how-to-add-dns-records-on-porkbun), [Nginx proxy directives](https://nginx.org/en/docs/http/ngx_http_proxy_module.html), [Certbot Nginx instructions](https://certbot.eff.org/instructions?os=snap&ws=nginx).
